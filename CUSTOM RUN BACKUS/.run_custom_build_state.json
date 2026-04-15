@@ -1,0 +1,7 @@
+{
+  "gpu": {
+    "vendor": "nvidia",
+    "check": false,
+    "extra_flags": []
+  }
+}

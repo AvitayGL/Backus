@@ -1,0 +1,826 @@
+#!/usr/bin/env python3
+
+import argparse
+import getpass
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+
+ROOT_DIR = Path(".").resolve()
+SCRIPTS_DIR = ROOT_DIR / "src" / "Scripts"
+DATAFILE = ROOT_DIR / "src" / "Datafiles" / "datafile.json"
+OUTPUT_ROOT = ROOT_DIR / "outputs"
+HELPER_SCRIPT = ROOT_DIR / "run_single_permutation_slurm.py"
+BUILD_STATE_FILE = ROOT_DIR / ".run_custom_build_state.json"
+DEFAULT_SERIAL_PARTITION = "cluster"
+DEFAULT_GPU_PARTITION = "gpua100"
+DEFAULT_ACCOUNT = "rcl"
+SERIAL_FIXED_THREADS = 1
+GPU_FIXED_THREADS = 1
+TARGET_EXECUTABLES = {
+    "serial": ROOT_DIR / "src" / "exec" / "main_cpu",
+    "gpu": ROOT_DIR / "src" / "exec" / "main_gpu",
+}
+TARGET_BUILD_DIRS = {
+    "serial": ROOT_DIR / "build_cpu",
+    "gpu": ROOT_DIR / "build_gpu",
+}
+
+
+def normalize_help_flag(argv: List[str]) -> List[str]:
+    return ["--help" if item == "-help" else item for item in argv]
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return number
+
+
+def strip_outer_parentheses(expression: str, label: str) -> str:
+    text = expression.strip()
+    if not text.startswith("(") or not text.endswith(")"):
+        raise argparse.ArgumentTypeError(
+            f"{label} must use parentheses, for example '(1 2 4)'"
+        )
+    return text[1:-1].strip()
+
+
+def parse_string_list(expression: str, label: str) -> List[str]:
+    inner = strip_outer_parentheses(expression, label)
+    if not inner:
+        return []
+    return shlex.split(inner)
+
+
+def resolve_path(base_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def configure_paths(main_dir_arg: str, output_dir_arg: str) -> None:
+    global ROOT_DIR
+    global SCRIPTS_DIR
+    global DATAFILE
+    global OUTPUT_ROOT
+    global HELPER_SCRIPT
+    global BUILD_STATE_FILE
+    global TARGET_EXECUTABLES
+    global TARGET_BUILD_DIRS
+
+    ROOT_DIR = resolve_path(Path.cwd(), main_dir_arg)
+    SCRIPTS_DIR = ROOT_DIR / "src" / "Scripts"
+    DATAFILE = ROOT_DIR / "src" / "Datafiles" / "datafile.json"
+    OUTPUT_ROOT = resolve_path(ROOT_DIR, output_dir_arg)
+    HELPER_SCRIPT = ROOT_DIR / "run_single_permutation_slurm.py"
+    BUILD_STATE_FILE = ROOT_DIR / ".run_custom_build_state.json"
+    TARGET_EXECUTABLES = {
+        "serial": ROOT_DIR / "src" / "exec" / "main_cpu",
+        "gpu": ROOT_DIR / "src" / "exec" / "main_gpu",
+    }
+    TARGET_BUILD_DIRS = {
+        "serial": ROOT_DIR / "build_cpu",
+        "gpu": ROOT_DIR / "build_gpu",
+    }
+
+
+def vendor_token(vendor: str) -> str:
+    return "NVHPC" if vendor == "nvidia" else "INTEL"
+
+
+def mode_targets(mode: str) -> List[str]:
+    return [mode]
+
+
+def build_target_name(target: str) -> str:
+    if target == "serial":
+        return "cpu"
+    return "gpu"
+
+
+def load_build_state() -> Dict[str, Dict[str, object]]:
+    if not BUILD_STATE_FILE.exists():
+        return {}
+    try:
+        with BUILD_STATE_FILE.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            if "serial" not in data and "cpu" in data:
+                data["serial"] = data["cpu"]
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_build_state(state: Dict[str, Dict[str, object]]) -> None:
+    BUILD_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def build_signature(vendor: str, check: bool, extra_flags: Sequence[str]) -> Dict[str, object]:
+    return {
+        "vendor": vendor,
+        "check": check,
+        "extra_flags": list(extra_flags),
+    }
+
+
+def build_needs_clean(target: str, signature: Dict[str, object], state: Dict[str, Dict[str, object]]) -> bool:
+    executable_path = TARGET_EXECUTABLES[target]
+    build_dir = TARGET_BUILD_DIRS[target]
+    previous = state.get(target)
+    return previous != signature or not build_dir.exists() or not executable_path.exists()
+
+
+def run_logged_command(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    env: Dict[str, str],
+    log_path: Path,
+) -> None:
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("$ {0}\n".format(" ".join(shlex.quote(part) for part in command)))
+        handle.flush()
+        result = subprocess.run(
+            list(command),
+            cwd=cwd,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            check=False,
+        )
+        handle.write("\n")
+    if result.returncode != 0:
+        raise RuntimeError(
+            "command failed with exit code {0}: {1}".format(
+                result.returncode,
+                " ".join(command),
+            )
+        )
+
+
+def prepare_build_environment(
+    *,
+    vendor: str,
+    check_mode: bool,
+    extra_cpu_flags: Sequence[str],
+    extra_gpu_flags: Sequence[str],
+) -> Dict[str, str]:
+    env = os.environ.copy()
+    env["SCALSALE_CHECK_MODE"] = "1" if check_mode else "0"
+    env["SCALSALE_EXTRA_CPU_FLAGS"] = " ".join(extra_cpu_flags)
+    env["SCALSALE_EXTRA_GPU_FLAGS"] = " ".join(extra_gpu_flags)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+
+    if not shutil.which("sbatch", path=env.get("PATH")):
+        raise RuntimeError("sbatch not found in PATH. Load your Slurm environment before running ./run_custom.")
+
+    return env
+
+
+def perform_builds(
+    *,
+    requested_targets: Sequence[str],
+    vendor: str,
+    check_mode: bool,
+    extra_cpu_flags: Sequence[str],
+    extra_gpu_flags: Sequence[str],
+    force_clean: bool,
+    run_dir: Path,
+) -> Dict[str, str]:
+    state = load_build_state()
+    target_signatures = {
+        "serial": build_signature(vendor, check_mode, extra_cpu_flags),
+        "gpu": build_signature(vendor, check_mode, extra_gpu_flags),
+    }
+
+    clean_targets: List[str] = []
+    make_targets: List[str] = []
+
+    for target in requested_targets:
+        if force_clean or build_needs_clean(target, target_signatures[target], state):
+            clean_targets.append(target)
+        else:
+            make_targets.append(target)
+
+    build_env = prepare_build_environment(
+        vendor=vendor,
+        check_mode=check_mode,
+        extra_cpu_flags=extra_cpu_flags,
+        extra_gpu_flags=extra_gpu_flags,
+    )
+    build_log = run_dir / "build.log"
+    build_log.write_text("", encoding="utf-8")
+
+    with build_log.open("a", encoding="utf-8") as handle:
+        handle.write("run_custom build summary\n")
+        handle.write("vendor: {0}\n".format(vendor))
+        handle.write("check_mode: {0}\n".format("1" if check_mode else "0"))
+        handle.write("clean_requested: {0}\n".format("1" if force_clean else "0"))
+        handle.write("targets: {0}\n".format(", ".join(requested_targets)))
+        handle.write("clean_targets: {0}\n".format(", ".join(clean_targets) if clean_targets else "none"))
+        handle.write("make_targets: {0}\n".format(", ".join(make_targets) if make_targets else "none"))
+        handle.write("extra_cpu_flags: {0}\n".format(" ".join(extra_cpu_flags) if extra_cpu_flags else "none"))
+        handle.write("extra_gpu_flags: {0}\n".format(" ".join(extra_gpu_flags) if extra_gpu_flags else "none"))
+        handle.write("\n")
+
+    if clean_targets:
+        try:
+            run_logged_command(
+                [
+                    str(SCRIPTS_DIR / "clean.sh"),
+                    vendor_token(vendor),
+                    *[build_target_name(target) for target in clean_targets],
+                ],
+                cwd=SCRIPTS_DIR,
+                env=build_env,
+                log_path=build_log,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "{0}. See {1}. A clean rebuild needs the MPI compiler wrapper in PATH "
+                "(for example mpif90 for NVIDIA or mpiifx for Intel).".format(
+                    exc,
+                    build_log,
+                )
+            )
+
+    if make_targets:
+        try:
+            run_logged_command(
+                [str(SCRIPTS_DIR / "make.sh"), *[build_target_name(target) for target in make_targets]],
+                cwd=SCRIPTS_DIR,
+                env=build_env,
+                log_path=build_log,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "{0}. See {1}.".format(
+                    exc,
+                    build_log,
+                )
+            )
+
+    for target in requested_targets:
+        executable_path = TARGET_EXECUTABLES[target]
+        if not executable_path.exists():
+            raise RuntimeError(
+                "expected executable was not created: {0}".format(executable_path)
+            )
+        state[target] = target_signatures[target]
+
+    save_build_state(state)
+    return {
+        target: "clean" if target in clean_targets else "make"
+        for target in requested_targets
+    }
+
+
+def create_run_directory(
+    threads: int,
+    mode: str,
+    vendor: str,
+    physics: str,
+    process_layout: Tuple[int, int, int],
+    grid: Tuple[int, int, int],
+) -> Path:
+    base_dir = OUTPUT_ROOT / "{0}_{1}_{2}_threads{3}_mpi{4}x{5}x{6}_grid{7}x{8}x{9}".format(
+        mode,
+        vendor,
+        physics,
+        threads,
+        process_layout[0],
+        process_layout[1],
+        process_layout[2],
+        grid[0],
+        grid[1],
+        grid[2],
+    )
+    run_dir = base_dir
+    suffix = 2
+    while run_dir.exists():
+        run_dir = Path("{0}_{1}".format(base_dir, suffix))
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def validate_runtime_options(args: argparse.Namespace) -> None:
+    if args.profile_ncu and args.profile_nsys:
+        raise SystemExit("use only one of -profile_ncu or -profile_nsys")
+
+    if args.mode == "serial" and (args.profile_ncu or args.profile_nsys or args.acc_notify):
+        raise SystemExit(
+            "-profile_ncu, -profile_nsys, and -acc_notify require -mode gpu"
+        )
+
+    if args.vendor != "nvidia" and (args.profile_ncu or args.profile_nsys or args.acc_notify):
+        raise SystemExit(
+            "-profile_ncu, -profile_nsys, and -acc_notify require -vendor nvidia"
+        )
+
+    if args.mode == "serial" and args.additional_flags_gpu:
+        raise SystemExit("-additional_flags_gpu is not valid with -mode serial")
+
+    if args.mode == "gpu" and args.additional_flags_serial:
+        raise SystemExit("-additional_flags_serial is not valid with -mode gpu")
+
+
+def resolve_target_partition(args: argparse.Namespace, target: str) -> Optional[str]:
+    if args.partition:
+        return args.partition
+    if target == "serial":
+        return DEFAULT_SERIAL_PARTITION
+    return DEFAULT_GPU_PARTITION
+
+
+def resolve_target_account(args: argparse.Namespace, target: str) -> Optional[str]:
+    if args.account:
+        return args.account
+    return DEFAULT_ACCOUNT
+
+
+def resolve_target_threads(args: argparse.Namespace, target: str) -> List[int]:
+    if target == "gpu":
+        return [GPU_FIXED_THREADS]
+    return [SERIAL_FIXED_THREADS]
+
+
+def process_layout_count(process_layout: Tuple[int, int, int]) -> int:
+    return process_layout[0] * process_layout[1] * process_layout[2]
+
+
+def active_jobs_for_user(user: str) -> List[str]:
+    result = subprocess.run(
+        ["squeue", "-h", "-u", user, "-o", "%A"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        error_text = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise RuntimeError(
+            "failed to query Slurm queue for user {0}: {1}".format(user, error_text)
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def latest_active_job_id_for_user() -> Optional[str]:
+    user = os.environ.get("USER") or getpass.getuser()
+    active_jobs = active_jobs_for_user(user)
+    if not active_jobs:
+        return None
+    return str(max(int(job_id) for job_id in active_jobs))
+
+
+def job_dir_name(
+    target: str,
+    threads: int,
+    process_layout: Tuple[int, int, int],
+    grid: Tuple[int, int, int],
+) -> str:
+    return "{0}_threads{1}_mpi{2}x{3}x{4}_grid{5}x{6}x{7}".format(
+        target,
+        threads,
+        process_layout[0],
+        process_layout[1],
+        process_layout[2],
+        grid[0],
+        grid[1],
+        grid[2],
+    )
+
+
+def job_name(
+    target: str,
+    threads: int,
+    process_layout: Tuple[int, int, int],
+    grid: Tuple[int, int, int],
+) -> str:
+    return "scal_{0}_t{1}_m{2}x{3}x{4}_g{5}x{6}x{7}".format(
+        target,
+        threads,
+        process_layout[0],
+        process_layout[1],
+        process_layout[2],
+        grid[0],
+        grid[1],
+        grid[2],
+    )
+
+
+def submit_jobs(
+    *,
+    args: argparse.Namespace,
+    run_dir: Path,
+    targets: Sequence[str],
+) -> List[Dict[str, object]]:
+    submissions: List[Dict[str, object]] = []
+    helper_path = str(HELPER_SCRIPT)
+    process_layout = (args.npx, args.npy, args.npz)
+    grid = (args.nx, args.ny, args.nz)
+    total_processes = process_layout_count(process_layout)
+
+    for target in targets:
+        executable_path = TARGET_EXECUTABLES[target]
+        for threads in resolve_target_threads(args, target):
+            permutation_dir = run_dir
+            target_partition = resolve_target_partition(args, target)
+            target_account = resolve_target_account(args, target)
+
+            command = [
+                sys.executable,
+                helper_path,
+                "-mode",
+                target,
+                "-vendor",
+                args.vendor,
+                "-physics",
+                args.physics,
+                "-grid_size",
+                "({0} {1} {2})".format(*grid),
+                "-threads",
+                str(threads),
+                "-process_layout",
+                "({0} {1} {2})".format(*process_layout),
+                "-job_name",
+                job_name(target, threads, process_layout, grid),
+                "-output_dir",
+                str(permutation_dir),
+                "-base_datafile",
+                str(DATAFILE),
+                "-executable_path",
+                str(executable_path),
+            ]
+
+            if target_partition:
+                command.extend(["-partition", target_partition])
+            if target_account:
+                command.extend(["-account", target_account])
+            if target == "gpu":
+                command.extend(["-gpu_request_mode", args.gpu_request_mode])
+                if args.gpu_request_mode == "gres":
+                    command.extend(["-gpu_gres_name", args.gpu_gres_name])
+
+            if args.max_cycles is not None:
+                command.extend(["-max_cycles", str(args.max_cycles)])
+            if target == "gpu" and args.profile_ncu:
+                command.append("-profile_ncu")
+            if target == "gpu" and args.profile_nsys:
+                command.append("-profile_nsys")
+            if target == "gpu" and args.acc_notify:
+                command.append("-acc_notify")
+
+            dependency_job_id = None
+            if target == "gpu":
+                dependency_job_id = latest_active_job_id_for_user()
+            if dependency_job_id is not None:
+                command.extend(["-dependency", "afterany:{0}".format(dependency_job_id)])
+                print(
+                    "Submitting job with dependency afterany:{0}".format(dependency_job_id),
+                    flush=True,
+                )
+            result = subprocess.run(
+                command,
+                cwd=ROOT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                check=False,
+            )
+
+            record_path = permutation_dir / "submission.json"
+            if record_path.exists():
+                with record_path.open("r", encoding="utf-8") as handle:
+                    record = json.load(handle)
+            else:
+                record = {
+                    "command": command[1:],
+                    "returncode": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                }
+
+            record["job_dir"] = str(permutation_dir)
+            record["partition"] = target_partition
+            record["account"] = target_account
+            record["process_layout"] = list(process_layout)
+            record["processes"] = total_processes
+            record["dependency"] = "afterany:{0}".format(dependency_job_id) if dependency_job_id is not None else None
+            submissions.append(record)
+
+            if result.returncode != 0:
+                error_text = result.stderr.strip() or result.stdout.strip() or "unknown error"
+                if "Invalid account or account/partition combination specified" in error_text:
+                    error_text = (
+                        error_text
+                        + ". Use -account ACCOUNT and/or -partition PARTITION for your cluster, "
+                          "or omit -partition so sbatch uses the default partition."
+                    )
+                if "Invalid generic resource (gres) specification" in error_text:
+                    error_text = (
+                        error_text
+                        + ". This cluster likely should not receive a GPU resource flag at all. "
+                          "Use the default -gpu_request_mode none, or override only if your site requires "
+                          "-gpu_request_mode gpus, -gpu_request_mode gpus-per-node, or -gpu_request_mode gres."
+                    )
+                raise RuntimeError(
+                    "failed to submit permutation in {0}: {1}".format(
+                        permutation_dir,
+                        error_text,
+                    )
+                )
+
+    return submissions
+
+
+def write_manifest(
+    *,
+    run_dir: Path,
+    args: argparse.Namespace,
+    build_actions: Dict[str, str],
+    submissions: Sequence[Dict[str, object]],
+) -> None:
+    manifest = {
+        "mode": args.mode,
+        "vendor": args.vendor,
+        "physics": args.physics,
+        "main_dir": str(ROOT_DIR),
+        "output_dir": str(OUTPUT_ROOT),
+        "serial_fixed_threads": SERIAL_FIXED_THREADS,
+        "gpu_fixed_threads": GPU_FIXED_THREADS,
+        "npx": args.npx,
+        "npy": args.npy,
+        "npz": args.npz,
+        "process_layout": [args.npx, args.npy, args.npz],
+        "total_processes": args.npx * args.npy * args.npz,
+        "nx": args.nx,
+        "ny": args.ny,
+        "nz": args.nz,
+        "grid": [args.nx, args.ny, args.nz],
+        "max_cycles": args.max_cycles,
+        "check": args.check,
+        "clean": args.clean,
+        "profile_ncu": args.profile_ncu,
+        "profile_nsys": args.profile_nsys,
+        "acc_notify": args.acc_notify,
+        "partition": args.partition,
+        "account": args.account,
+        "gpu_request_mode": args.gpu_request_mode,
+        "gpu_gres_name": args.gpu_gres_name,
+        "additional_flags_serial": args.additional_flags_serial,
+        "additional_flags_gpu": args.additional_flags_gpu,
+        "build_actions": build_actions,
+        "jobs": list(submissions),
+    }
+    (run_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    description = """Build once and submit one Slurm job for the requested ScalSALE configuration.
+
+Important shell syntax:
+  - Additional compilation flags must be written as one parenthesized argument.
+  - Because bash treats parentheses specially, quote those flag lists.
+  - Examples:
+      -additional_flags_serial "(-Mnovect -g)"
+      -additional_flags_gpu "(-gpu=cc80)"
+
+Scalar runtime parameters:
+  - npx, npy, npz are the MPI-process counts along x, y, z
+  - nx, ny, nz are the grid sizes along x, y, z
+  - This wrapper now submits exactly one process layout and one grid per invocation
+
+Fixed thread behavior:
+  serial jobs always run with 1 thread
+  gpu jobs always run with 1 thread
+
+The base src/Datafiles/datafile.json is not edited in place. Each Slurm job gets its own
+copied datafile inside its output directory.
+
+Cluster defaults in this wrapper:
+  serial partition: cluster
+  GPU partition: gpua100
+  serial account: rcl
+  GPU account: rcl
+  GPU request mode: none
+"""
+    epilog = """Examples:
+  Serial:
+    ./run_custom -mode serial -vendor nvidia -physics euler -npx 2 -npy 1 -npz 1 -nx 64 -ny 64 -nz 64
+
+  GPU only with Nsight Compute:
+    ./run_custom -mode gpu -vendor nvidia -physics lagrange -npx 1 -npy 1 -npz 1 -nx 20 -ny 20 -nz 20 -profile_ncu
+
+Behavior:
+  - -clean forces a full rebuild with ./src/Scripts/clean.sh for the requested targets.
+  - Without -clean, the script uses ./src/Scripts/make.sh when the stored build config matches.
+  - If vendor, -check, or additional compilation flags changed since the last build of a target,
+    the script automatically switches that target to a clean rebuild.
+  - GPU jobs check the current user's active Slurm jobs and, if needed, submit with an afterany dependency on the latest active job ID.
+  - serial jobs default to partition cluster, gpu jobs default to partition gpua100, and both default to account rcl.
+  - GPU jobs default to -gpu_request_mode none, which omits explicit GPU resource flags and relies on the GPU partition.
+  - serial jobs always use 1 thread and gpu jobs always use 1 thread.
+"""
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=description,
+        epilog=epilog,
+    )
+
+    parser.add_argument("-mode", choices=["serial", "gpu"], required=True)
+    parser.add_argument("-vendor", choices=["nvidia", "intel"], required=True)
+    parser.add_argument("-physics", choices=["lagrange", "euler"], required=True)
+    parser.add_argument(
+        "-npx",
+        type=positive_int,
+        default=1,
+        help="number of MPI processes along x; default 1",
+    )
+    parser.add_argument(
+        "-npy",
+        type=positive_int,
+        default=1,
+        help="number of MPI processes along y; default 1",
+    )
+    parser.add_argument(
+        "-npz",
+        type=positive_int,
+        default=1,
+        help="number of MPI processes along z; default 1",
+    )
+    parser.add_argument(
+        "-nx",
+        type=positive_int,
+        required=True,
+        help="grid size along x",
+    )
+    parser.add_argument(
+        "-ny",
+        type=positive_int,
+        required=True,
+        help="grid size along y",
+    )
+    parser.add_argument(
+        "-nz",
+        type=positive_int,
+        required=True,
+        help="grid size along z",
+    )
+    parser.add_argument(
+        "-max_cycles",
+        type=positive_int,
+        help="set simulation_parameters.max_ncyc in each job-local datafile",
+    )
+    parser.add_argument(
+        "-check",
+        action="store_true",
+        help="use correctness/debug compile flags from src/CMakeLists.txt",
+    )
+    parser.add_argument(
+        "-clean",
+        action="store_true",
+        help="force a clean rebuild with ./src/Scripts/clean.sh; if omitted, the script prefers ./src/Scripts/make.sh",
+    )
+    parser.add_argument(
+        "-profile_ncu",
+        action="store_true",
+        help="wrap GPU jobs with Nsight Compute; valid only with -vendor nvidia",
+    )
+    parser.add_argument(
+        "-profile_nsys",
+        action="store_true",
+        help="wrap GPU jobs with Nsight Systems; valid only with -vendor nvidia",
+    )
+    parser.add_argument(
+        "-acc_notify",
+        action="store_true",
+        help="export NVCOMPILER_ACC_NOTIFY=3 in GPU Slurm jobs; valid only with -vendor nvidia",
+    )
+    parser.add_argument(
+        "-additional_flags_serial",
+        default="()",
+        help="quoted list of extra serial compilation flags, for example '(-Mnovect -g)'",
+    )
+    parser.add_argument(
+        "-additional_flags_gpu",
+        default="()",
+        help="quoted list of extra GPU compilation flags, for example '(-gpu=cc80)'",
+    )
+    parser.add_argument(
+        "-gpu_request_mode",
+        choices=["none", "gpus", "gpus-per-node", "gres"],
+        default="none",
+        help="Slurm GPU request syntax for GPU jobs; default omits GPU resource flags and relies on the GPU partition",
+    )
+    parser.add_argument(
+        "-gpu_gres_name",
+        default="gpu",
+        help="GRES resource name used only when -gpu_request_mode gres",
+    )
+    parser.add_argument(
+        "-partition",
+        help="Slurm partition override for the selected mode; default is cluster for serial and gpua100 for gpu",
+    )
+    parser.add_argument(
+        "-account",
+        help="Slurm account override for the selected mode; default is rcl",
+    )
+    parser.add_argument(
+        "-output_dir",
+        default="outputs",
+        help="output root directory; default is 'outputs' under -main_dir",
+    )
+    parser.add_argument(
+        "-main_dir",
+        default=".",
+        help="absolute or relative path to the main project folder; default is '.'",
+    )
+    args = parser.parse_args(argv)
+    args.additional_flags_serial = parse_string_list(args.additional_flags_serial, "additional_flags_serial")
+    args.additional_flags_gpu = parse_string_list(args.additional_flags_gpu, "additional_flags_gpu")
+    return args
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    cli_args = list(argv if argv is not None else sys.argv[1:])
+    args = parse_args(normalize_help_flag(cli_args))
+    configure_paths(args.main_dir, args.output_dir)
+    validate_runtime_options(args)
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    if not DATAFILE.exists():
+        raise SystemExit("base datafile not found: {0}".format(DATAFILE))
+    if not HELPER_SCRIPT.exists():
+        raise SystemExit("single-permutation helper not found: {0}".format(HELPER_SCRIPT))
+
+    extra_serial_flags = list(args.additional_flags_serial)
+    extra_gpu_flags = list(args.additional_flags_gpu)
+    targets = mode_targets(args.mode)
+    primary_target = targets[0]
+    primary_threads = resolve_target_threads(args, primary_target)[0]
+
+    run_dir = create_run_directory(
+        primary_threads,
+        args.mode,
+        args.vendor,
+        args.physics,
+        (args.npx, args.npy, args.npz),
+        (args.nx, args.ny, args.nz),
+    )
+
+    build_actions = perform_builds(
+        requested_targets=targets,
+        vendor=args.vendor,
+        check_mode=args.check,
+        extra_cpu_flags=extra_serial_flags,
+        extra_gpu_flags=extra_gpu_flags,
+        force_clean=args.clean,
+        run_dir=run_dir,
+    )
+
+    submissions = submit_jobs(args=args, run_dir=run_dir, targets=targets)
+    write_manifest(
+        run_dir=run_dir,
+        args=args,
+        build_actions=build_actions,
+        submissions=submissions,
+    )
+
+    print("Run directory: {0}".format(run_dir))
+    print("Build actions: {0}".format(", ".join("{0}:{1}".format(k, v) for k, v in build_actions.items())))
+    print("Submitted jobs: {0}".format(len(submissions)))
+    for record in submissions:
+        job_id = record.get("job_id") or "unknown"
+        print(
+            "  job_id={0} mode={1} threads={2} layout={3} processes={4} grid={5} dir={6}".format(
+                job_id,
+                record.get("mode"),
+                record.get("threads"),
+                "x".join(str(value) for value in record.get("process_layout", [])),
+                record.get("processes"),
+                "x".join(str(value) for value in record.get("grid", [])),
+                record.get("job_dir"),
+            )
+        )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

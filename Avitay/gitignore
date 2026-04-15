@@ -1,0 +1,54 @@
+# Prerequisites
+**.d
+
+# Compiled Object files
+**.slo
+**.lo
+**.o
+**.obj
+
+# Precompiled Headers
+**.gch
+**.pch
+
+# Compiled Dynamic libraries
+**.so
+**.dylib
+**.dll
+
+# Fortran module files
+**.mod
+**.smod
+
+# Compiled Static libraries
+**.lai
+**.la
+**.a
+**.lib
+
+# Executables
+**.exe
+**.out
+*.app
+
+**.ipny*
+
+**r0*
+src/Scripts/diags*
+src/Scripts/velocity_result.txt
+src/Scripts/track*
+src/Scripts/debug*
+src/Scripts/report*
+src/Scripts/*nsys
+src/Scripts/*ncu
+src/Scripts/run*
+src/exec/*
+
+build_cpu/*
+build_gpu/*
+build/*
+outputs/
+.run_custom_build_state.json
+
+
+src/Scripts/#track_validation_lagrangian#
